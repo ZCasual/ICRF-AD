@@ -5,7 +5,7 @@ import math
 
 class SimplifiedUNet(nn.Module):
     """简化版U-Net用于分割任务"""
-    def __init__(self, input_channels=1, output_channels=1):
+    def __init__(self, input_channels=1, output_channels=1, adv_mode=False):
         super().__init__()
         self.input_channels = input_channels
         self.output_channels = output_channels
@@ -72,6 +72,15 @@ class SimplifiedUNet(nn.Module):
             nn.Conv2d(8, 1, kernel_size=1),
             nn.Sigmoid()
         )
+        
+        # 新增对抗训练专用层
+        self.adv_mode = adv_mode
+        if adv_mode:
+            self.feature_perturb = nn.Sequential(
+                nn.Conv2d(16, 16, 3, padding=1),
+                nn.InstanceNorm2d(16),
+                nn.ReLU()
+            )
     
     def forward(self, x):
         """前向传播"""
@@ -102,5 +111,9 @@ class SimplifiedUNet(nn.Module):
         # 确保输出类型与输入一致（支持混合精度训练）
         if enhanced_out.dtype != x.dtype:
             enhanced_out = enhanced_out.to(x.dtype)
+        
+        # 在解码路径添加扰动
+        if self.adv_mode and hasattr(self, 'feature_perturb'):
+            dec1 = self.feature_perturb(dec1)
         
         return enhanced_out
