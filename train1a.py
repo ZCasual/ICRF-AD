@@ -66,7 +66,8 @@ class TADPipelineAdversarial(TADBaseConfig):
         with tqdm(range(self.num_epochs), desc="Training Progress") as epoch_pbar:
             for epoch in epoch_pbar:
                 # 用于跟踪当前epoch的平均损失
-                epoch_losses = {'total': 0.0, 'gen': 0.0, 'disc': 0.0, 'adv': 0.0}
+                epoch_losses = {'total': 0.0, 'gen': 0.0, 'adv': 0.0, 
+                               'size_penalty': 0.0, 'variance_penalty': 0.0}
                 
                 # 内部进度条跟踪tile处理
                 with tqdm(enumerate(tiles), total=len(tiles), desc=f"Epoch {epoch+1}/{self.num_epochs}") as tile_pbar:
@@ -86,11 +87,12 @@ class TADPipelineAdversarial(TADBaseConfig):
                         losses['total'].backward()
                         self.optimizer.step()
                         
-                        # 更新内部进度条
+                        # 更新内部进度条 - 修改这里，使用新的损失键名
                         tile_pbar.set_postfix({
                             'loss': f"{losses['total'].item():.4f}",
                             'gen': f"{losses['gen'].item():.4f}",
-                            'disc': f"{losses['disc'].item():.4f}"
+                            'adv': f"{losses['adv'].item():.4f}",  # 使用adv而不是disc
+                            'size': f"{losses.get('size_penalty', torch.tensor(0.0)).item():.4f}"
                         })
                         
                         # 保存第一个tile的输出用于可视化
@@ -111,11 +113,12 @@ class TADPipelineAdversarial(TADBaseConfig):
                 for k in epoch_losses:
                     epoch_losses[k] /= len(tiles)
                 
-                # 更新外部进度条
+                # 更新外部进度条 - 修改这里，使用新的损失键名
                 epoch_pbar.set_postfix({
                     'avg_loss': f"{epoch_losses['total']:.4f}",
                     'gen_loss': f"{epoch_losses['gen']:.4f}",
-                    'disc_loss': f"{epoch_losses['disc']:.4f}"
+                    'adv_loss': f"{epoch_losses['adv']:.4f}",  # 使用adv而不是disc
+                    'size_p': f"{epoch_losses.get('size_penalty', 0.0):.4f}"
                 })
                 
                 # 每5个epoch可视化一次
@@ -132,32 +135,45 @@ class TADPipelineAdversarial(TADBaseConfig):
             torch.save(self.adv_net.state_dict(), model_path)
 
     def _compute_losses(self, outputs, real_labels):
-        # 生成器损失
-        gen_loss = F.binary_cross_entropy(outputs['gen_seg'], real_labels)
+        """整合网络内部和外部损失"""
+        # 使用AdversarialTAD内部的损失计算
+        losses = self.adv_net._compute_loss(outputs, real_labels)
         
-        # 对抗损失（生成器欺骗判别器）
-        adv_loss = F.binary_cross_entropy(
-            outputs['fake_prob'], 
-            torch.ones_like(outputs['fake_prob'])
-        )
+        # 提取额外的尺度信息
+        if hasattr(self.adv_net.generator, 'scale_info'):
+            scale_info = self.adv_net.generator.scale_info
+            
+            # 记录尺度权重用于可视化
+            if not hasattr(self, 'scale_weight_history'):
+                self.scale_weight_history = []
+            
+            self.scale_weight_history.append(scale_info['weights'].detach().cpu())
+            
+            # 每10个epoch可视化尺度分布
+            if len(self.scale_weight_history) % 10 == 0:
+                self._visualize_scale_weights()
         
-        # 判别器损失
-        real_loss = F.binary_cross_entropy(
-            outputs['real_prob'],
-            torch.ones_like(outputs['real_prob'])
-        )
-        fake_loss = F.binary_cross_entropy(
-            outputs['fake_prob'],
-            torch.zeros_like(outputs['fake_prob'])
-        )
-        disc_loss = (real_loss + fake_loss) / 2
+        return losses
+
+    def _visualize_scale_weights(self):
+        """可视化尺度权重分布"""
+        # 计算平均尺度权重
+        avg_weights = torch.cat(self.scale_weight_history[-10:], dim=0)
+        avg_weights = avg_weights.mean(dim=0).numpy()
         
-        return {
-            'total': gen_loss + self.adv_net.adv_weight * adv_loss + disc_loss,
-            'gen': gen_loss,
-            'adv': adv_loss,
-            'disc': disc_loss
-        }
+        # 创建可视化图
+        plt.figure(figsize=(10, 6))
+        labels = ['Small', 'Medium', 'Large', 'Extra Large']
+        plt.bar(labels, avg_weights.flatten())
+        plt.title('TAD Scale Preference')
+        plt.ylabel('Average Weight')
+        plt.tight_layout()
+        
+        # 保存图像
+        os.makedirs(os.path.join(self.output_root, self.chr_name, "scale_vis"), exist_ok=True)
+        plt.savefig(os.path.join(self.output_root, self.chr_name, "scale_vis", 
+                               f"scale_weights_{len(self.scale_weight_history)}.png"))
+        plt.close()
 
     def _get_real_labels(self, matrix):
         """生成真实标签（示例实现）"""
@@ -222,6 +238,20 @@ class TADPipelineAdversarial(TADBaseConfig):
             # 保存处理后的numpy数组以供进一步分析
             np.save(os.path.join(epoch_dir, "segmentation.npy"), segmentation)
             np.save(os.path.join(epoch_dir, "boundary_map.npy"), edge_map)
+            
+            # 添加尺度偏好可视化
+            if hasattr(self.adv_net.generator, 'scale_info'):
+                scale_info = self.adv_net.generator.scale_info
+                scale_weights = scale_info['weights'].cpu().numpy()[0].flatten()
+                
+                plt.figure(figsize=(10, 6))
+                labels = ['Small', 'Medium', 'Large', 'Extra Large']
+                plt.bar(labels, scale_weights)
+                plt.title('Current TAD Scale Preference')
+                plt.ylabel('Weight')
+                plt.tight_layout()
+                plt.savefig(os.path.join(epoch_dir, "scale_preference.png"), dpi=300)
+                plt.close()
             
         except Exception as e:
             print(f"Visualization error: {str(e)}")

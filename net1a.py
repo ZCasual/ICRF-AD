@@ -176,6 +176,100 @@ class AdversarialTAD(nn.Module):
         self.load_state_dict(model_dict)
         print("成功加载预训练参数，保持冻结状态")
 
+    def _compute_loss(self, outputs, real_labels):
+        """增强的损失计算，添加TAD长度约束"""
+        # 获取生成结果
+        gen_seg = outputs['gen_seg']  # [B,1,H,W]
+        
+        # 原有损失计算
+        gen_loss = F.binary_cross_entropy(gen_seg, real_labels)
+        
+        # 对抗损失
+        adv_loss = F.binary_cross_entropy(
+            outputs['fake_prob'], 
+            torch.ones_like(outputs['fake_prob'])
+        )
+        
+        # ----- 新增TAD长度约束 -----
+        # 1. 计算标签中的TAD长度分布
+        tad_sizes = self._compute_tad_sizes(real_labels)
+        mean_size, std_size = tad_sizes['mean'], tad_sizes['std']
+        
+        # 2. 计算生成结果中的TAD长度分布
+        gen_tad_sizes = self._compute_tad_sizes(gen_seg)
+        gen_mean, gen_std = gen_tad_sizes['mean'], gen_tad_sizes['std']
+        
+        # 3. 对生成的TAD中过短的区域施加惩罚
+        if gen_mean < mean_size * 0.5:  # 如果平均长度小于参考长度一半
+            size_penalty = torch.exp(-gen_mean / (mean_size * 0.25)) * 0.2
+        else:
+            size_penalty = torch.tensor(0.0, device=gen_seg.device)
+            
+        # 4. 对长度方差大的情况施加轻微惩罚(鼓励均匀性)
+        variance_penalty = torch.clamp(gen_std / (mean_size * 0.5), 0, 1) * 0.1
+        
+        # 汇总所有损失
+        total_loss = gen_loss + self.adv_weight * adv_loss + size_penalty + variance_penalty
+        
+        return {
+            'total': total_loss,
+            'gen': gen_loss,
+            'adv': adv_loss,
+            'size_penalty': size_penalty,
+            'variance_penalty': variance_penalty
+        }
+        
+    def _compute_tad_sizes(self, segmentation):
+        """计算TAD尺寸统计信息"""
+        # 预处理分割结果
+        seg_binary = (segmentation > 0.5).float()
+        B, C, H, W = seg_binary.shape
+        
+        # 连通区域分析
+        sizes = []
+        areas = []
+        
+        # 对每个批次处理
+        for b in range(B):
+            img = seg_binary[b, 0].cpu().numpy()
+            
+            # 计算行差异 (简单近似连通区域)
+            row_diff = np.abs(np.diff(img, axis=0))
+            # 找出变化点 (TAD边界)
+            boundaries = np.where(row_diff > 0.5)[0]
+            
+            if len(boundaries) > 1:
+                # 计算相邻边界间距离 (TAD大小)
+                tad_sizes = np.diff(boundaries)
+                sizes.extend(tad_sizes.tolist())
+                
+                # 计算区域面积
+                for i in range(len(boundaries)-1):
+                    start, end = boundaries[i], boundaries[i+1]
+                    area = np.sum(img[start:end, :])
+                    areas.append(area)
+        
+        # 计算统计信息
+        if len(sizes) > 0:
+            mean_size = torch.tensor(np.mean(sizes), device=segmentation.device)
+            std_size = torch.tensor(np.std(sizes), device=segmentation.device)
+            max_size = torch.tensor(np.max(sizes), device=segmentation.device)
+            min_size = torch.tensor(np.min(sizes), device=segmentation.device)
+        else:
+            # 防止空列表
+            mean_size = torch.tensor(H/10, device=segmentation.device)  # 默认期望值
+            std_size = torch.tensor(H/20, device=segmentation.device)
+            max_size = torch.tensor(H/5, device=segmentation.device)
+            min_size = torch.tensor(H/20, device=segmentation.device)
+            
+        return {
+            'mean': mean_size,
+            'std': std_size,
+            'max': max_size,
+            'min': min_size,
+            'count': len(sizes)
+        }
+
 class TADFeatureExtractor(TADBaseConfig):
     """TAD特征提取器：从HiC数据中提取特征矩阵"""
     
