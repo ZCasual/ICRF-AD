@@ -40,27 +40,6 @@ class TADPipelineAdversarial(TADBaseConfig):
         print(f"[DEBUG] matrix_sum = {np.sum(matrix)}")
         return matrix
 
-    def _create_model(self, patch_size=None):
-        """Create DINO-V2 model based on A-VIT backbone network"""
-        model_params = self.get_model_params()
-        if patch_size is not None:
-            model_params['patch_size'] = patch_size
-        model = AVIT_DINO(
-            embed_dim=model_params['embed_dim'], 
-            patch_size=model_params['patch_size'], 
-            num_layers=model_params['num_layers'], 
-            num_heads=model_params['num_heads'],
-            use_amp=model_params['use_amp'],
-            ema_decay=model_params['ema_decay'],
-            mask_ratio=model_params['mask_ratio'],
-            gamma_base=model_params['gamma_base'],
-            epsilon_base=model_params['epsilon_base'],
-            use_theory_gamma=model_params['use_theory_gamma'],
-            boundary_weight=model_params['boundary_weight']
-        ).to(self.device)
-        print(f"Creating DINO-V2 model with A-VIT backbone, parameters: {model_params}")
-        return model
-
     def train_model(self, cur_tensor):
         # 初始化模型
         self.adv_net = AdversarialTAD(freeze_ratio=0.75).to(self.device)
