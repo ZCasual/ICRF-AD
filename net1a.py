@@ -135,14 +135,18 @@ class AdversarialTAD(nn.Module):
         seq_features = gen_seg.view(B, C, H*W)
         seq_features = seq_features.contiguous()  # 显式确保连续
         
-        # 判别器处理
+        # 判别器处理 - 传入原始矩阵用于结构约束评估
         _, _, real_prob = self.discriminator(matrix)
-        _, _, fake_prob = self.discriminator(seq_features, is_sequence=True)
+        boundary_probs, boundary_adj, fake_prob = self.discriminator(
+            seq_features, is_sequence=True, hic_matrix=matrix  # 添加原始矩阵
+        )
         
         return {
             'gen_seg': gen_seg,
             'real_prob': real_prob,
-            'fake_prob': fake_prob
+            'fake_prob': fake_prob,
+            'boundary_probs': boundary_probs,
+            'boundary_adj': boundary_adj
         }
 
     def _merge_results(self, results):

@@ -47,8 +47,8 @@ class TADPipelineAdversarial(TADBaseConfig):
         
         # 使用分组优化器，不同组件使用不同学习率
         optimizer_params = [
-            {'params': self.adv_net.generator.parameters(), 'lr': 5e-4},  # 生成器使用更高的学习率
-            {'params': self.adv_net.discriminator.parameters(), 'lr': 2e-5}  # 判别器学习率低
+            {'params': self.adv_net.generator.parameters(), 'lr': 5e-3},  # 生成器使用更高的学习率
+            {'params': self.adv_net.discriminator.parameters(), 'lr': 2e-4}  # 判别器学习率低
         ]
         self.optimizer = torch.optim.AdamW(optimizer_params)
         
