@@ -68,7 +68,7 @@ class TADBaseConfig:
 
 class AdversarialTAD(nn.Module):
     """对抗学习框架（完整实现）"""
-    def __init__(self, embed_dim=64, freeze_ratio=0.75):
+    def __init__(self, embed_dim=64, freeze_ratio=0.75, use_structure_constraints=False):
         super().__init__()
         # 生成器 (分割网络)
         self.generator = SimplifiedUNet(1, 1, adv_mode=True)
@@ -86,6 +86,12 @@ class AdversarialTAD(nn.Module):
         
         # 对抗训练参数
         self.adv_weight = 0.1
+        
+        # 是否使用结构约束
+        self.use_structure_constraints = use_structure_constraints
+        
+        # 添加安全模式标志
+        self.safe_mode = True
         
     def _freeze_parameters(self, ratio):
         """智能冻结机制，优先冻结深层参数"""
@@ -135,10 +141,12 @@ class AdversarialTAD(nn.Module):
         seq_features = gen_seg.view(B, C, H*W)
         seq_features = seq_features.contiguous()  # 显式确保连续
         
-        # 判别器处理 - 传入原始矩阵用于结构约束评估
+        # 判别器处理 - 根据结构约束标志决定是否传入原始矩阵
         _, _, real_prob = self.discriminator(matrix)
         boundary_probs, boundary_adj, fake_prob = self.discriminator(
-            seq_features, is_sequence=True, hic_matrix=matrix  # 添加原始矩阵
+            seq_features, 
+            is_sequence=True, 
+            hic_matrix=matrix if self.use_structure_constraints else None  # 条件传入
         )
         
         return {
@@ -181,7 +189,7 @@ class AdversarialTAD(nn.Module):
         print("成功加载预训练参数，保持冻结状态")
 
     def _compute_loss(self, outputs, real_labels):
-        """增强的损失计算，添加TAD长度约束"""
+        """简化的损失计算，只保留主要约束"""
         # 获取生成结果
         gen_seg = outputs['gen_seg']  # [B,1,H,W]
         
@@ -194,7 +202,7 @@ class AdversarialTAD(nn.Module):
             torch.ones_like(outputs['fake_prob'])
         )
         
-        # ----- 新增TAD长度约束 -----
+        # ----- 只保留TAD长度约束 -----
         # 1. 计算标签中的TAD长度分布
         tad_sizes = self._compute_tad_sizes(real_labels)
         mean_size, std_size = tad_sizes['mean'], tad_sizes['std']
@@ -203,16 +211,18 @@ class AdversarialTAD(nn.Module):
         gen_tad_sizes = self._compute_tad_sizes(gen_seg)
         gen_mean, gen_std = gen_tad_sizes['mean'], gen_tad_sizes['std']
         
-        # 3. 对生成的TAD中过短的区域施加惩罚
+        # 3. 对生成的TAD中过短或过长的区域施加惩罚
         if gen_mean < mean_size * 0.5:  # 如果平均长度小于参考长度一半
             size_penalty = torch.exp(-gen_mean / (mean_size * 0.25)) * 0.2
+        elif gen_mean > mean_size * 2.0:  # 如果平均长度大于参考长度两倍
+            size_penalty = torch.exp((gen_mean - mean_size * 2.0) / mean_size) * 0.1
         else:
             size_penalty = torch.tensor(0.0, device=gen_seg.device)
             
         # 4. 对长度方差大的情况施加轻微惩罚(鼓励均匀性)
         variance_penalty = torch.clamp(gen_std / (mean_size * 0.5), 0, 1) * 0.1
         
-        # 汇总所有损失
+        # 汇总主要损失
         total_loss = gen_loss + self.adv_weight * adv_loss + size_penalty + variance_penalty
         
         return {
