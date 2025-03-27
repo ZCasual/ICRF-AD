@@ -305,7 +305,7 @@ class TADFeatureExtractor(TADBaseConfig):
                     if key in checkpoint['model_params']:
                         setattr(self, key, checkpoint['model_params'][key])
             
-            # 创建模型实例 - 只使用教师模型用于特征提取
+            # 创建模型实例
             model_params = self.get_model_params()
             self.model = AVIT(
                 embed_dim=model_params['embed_dim'],
@@ -315,12 +315,45 @@ class TADFeatureExtractor(TADBaseConfig):
                 use_amp=model_params['use_amp']
             ).to(self.device)
             
-            # 只加载教师模型状态字典
-            if 'teacher' in checkpoint:
-                # 使用教师模型替代学生模型进行特征提取
+            # 新增：模拟student到teacher的初始化流程
+            if 'student' in checkpoint and 'teacher' in checkpoint:
+                print("执行student->teacher初始化流程...")
+                
+                # 1. 先加载student模型状态
+                self.model.load_state_dict(checkpoint['student'])
+                
+                # 2. 创建一个临时的模型实例作为teacher
+                teacher_model = AVIT(
+                    embed_dim=model_params['embed_dim'],
+                    patch_size=model_params['patch_size'],
+                    num_layers=model_params['num_layers'],
+                    num_heads=model_params['num_heads'],
+                    use_amp=model_params['use_amp']
+                ).to(self.device)
+                
+                # 3. 加载teacher状态
+                teacher_model.load_state_dict(checkpoint['teacher'])
+                
+                # 4. 创建一个精简版模拟EMA更新过程
+                # 这里使用一个较大的权重(0.8)来融合student和teacher
+                alpha = 0.8  # teacher权重
+                with torch.no_grad():
+                    for param_s, param_t in zip(self.model.parameters(), teacher_model.parameters()):
+                        param_s.data = (1 - alpha) * param_s.data + alpha * param_t.data
+                
+                print("完成student-teacher融合初始化")
+                
+                # 释放teacher模型
+                del teacher_model
+                torch.cuda.empty_cache()
+                
+            elif 'teacher' in checkpoint:
+                # 兼容旧版本，直接加载teacher
+                print("使用旧版加载方式：直接加载teacher模型状态")
                 self.model.load_state_dict(checkpoint['teacher'])
             elif 'student' in checkpoint:
-                # 如果没有教师模型，使用学生模型
+                # 如果没有teacher，使用student
+                print("未找到teacher模型状态，使用student代替")
                 self.model.load_state_dict(checkpoint['student'])
             
             # 设置为评估模式
