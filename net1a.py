@@ -189,7 +189,7 @@ class AdversarialTAD(nn.Module):
         print("成功加载预训练参数，保持冻结状态")
 
     def _compute_loss(self, outputs, real_labels):
-        """简化的损失计算，只保留主要约束"""
+        """更智能的损失计算，结合TAD尺寸估计"""
         # 获取生成结果
         gen_seg = outputs['gen_seg']  # [B,1,H,W]
         
@@ -202,35 +202,103 @@ class AdversarialTAD(nn.Module):
             torch.ones_like(outputs['fake_prob'])
         )
         
-        # ----- 只保留TAD长度约束 -----
-        # 1. 计算标签中的TAD长度分布
-        tad_sizes = self._compute_tad_sizes(real_labels)
-        mean_size, std_size = tad_sizes['mean'], tad_sizes['std']
-        
-        # 2. 计算生成结果中的TAD长度分布
-        gen_tad_sizes = self._compute_tad_sizes(gen_seg)
-        gen_mean, gen_std = gen_tad_sizes['mean'], gen_tad_sizes['std']
-        
-        # 3. 对生成的TAD中过短或过长的区域施加惩罚
-        if gen_mean < mean_size * 0.5:  # 如果平均长度小于参考长度一半
-            size_penalty = torch.exp(-gen_mean / (mean_size * 0.25)) * 0.2
-        elif gen_mean > mean_size * 2.0:  # 如果平均长度大于参考长度两倍
-            size_penalty = torch.exp((gen_mean - mean_size * 2.0) / mean_size) * 0.1
-        else:
-            size_penalty = torch.tensor(0.0, device=gen_seg.device)
+        # ----- 使用UNet提供的TAD尺寸估计信息 -----
+        if hasattr(self.generator, 'scale_info') and 'tad_sizes' in self.generator.scale_info:
+            tad_sizes = self.generator.scale_info['tad_sizes']  # [B,3,1,1] - [min,avg,max]
             
-        # 4. 对长度方差大的情况施加轻微惩罚(鼓励均匀性)
-        variance_penalty = torch.clamp(gen_std / (mean_size * 0.5), 0, 1) * 0.1
+            # 提取TAD平均尺寸估计值
+            avg_size = tad_sizes[:, 1].squeeze()  # [B]
+            
+            # 1. 计算标签中的TAD分布
+            label_tad_sizes = self._compute_tad_sizes(real_labels)
+            label_mean = label_tad_sizes['mean']
+            label_std = label_tad_sizes['std']
+            
+            # 2. 计算生成结果中的TAD分布
+            gen_tad_sizes = self._compute_tad_sizes(gen_seg)
+            gen_mean = gen_tad_sizes['mean']
+            gen_std = gen_tad_sizes['std']
+            
+            # 3. 计算尺寸差异 - 使用相对差异而非绝对值
+            size_diff = torch.abs(gen_mean - label_mean) / (label_mean + 1e-5)
+            
+            # 4. 根据差异计算惩罚
+            # 使用指数函数，差异越大惩罚越大，但有上限
+            size_penalty = 0.2 * torch.tanh(2.0 * size_diff)
+            
+            # 5. 惩罚过高的TAD变异性
+            if gen_std > label_std * 2.0:
+                # 过高的标准差表示TAD大小不均衡
+                variance_penalty = 0.1 * torch.tanh((gen_std - label_std * 2.0) / (label_std + 1e-5))
+            else:
+                variance_penalty = torch.tensor(0.0, device=gen_seg.device)
+        else:
+            # 如果没有尺寸信息，使用原始计算方法
+            # 1. 计算标签中的TAD长度分布
+            tad_sizes = self._compute_tad_sizes(real_labels)
+            mean_size, std_size = tad_sizes['mean'], tad_sizes['std']
+            
+            # 2. 计算生成结果中的TAD长度分布
+            gen_tad_sizes = self._compute_tad_sizes(gen_seg)
+            gen_mean, gen_std = gen_tad_sizes['mean'], gen_tad_sizes['std']
+            
+            # 3. 对生成的TAD中过短或过长的区域施加惩罚
+            if gen_mean < mean_size * 0.5:  # 如果平均长度小于参考长度一半
+                size_penalty = torch.exp(-gen_mean / (mean_size * 0.25)) * 0.2
+            elif gen_mean > mean_size * 2.0:  # 如果平均长度大于参考长度两倍
+                size_penalty = torch.exp((gen_mean - mean_size * 2.0) / mean_size) * 0.1
+            else:
+                size_penalty = torch.tensor(0.0, device=gen_seg.device)
+            
+            # 4. 对长度方差大的情况施加轻微惩罚(鼓励均匀性)
+            variance_penalty = torch.clamp(gen_std / (mean_size * 0.5), 0, 1) * 0.1
         
-        # 汇总主要损失
-        total_loss = gen_loss + self.adv_weight * adv_loss + size_penalty + variance_penalty
+        # ----- 新增：边界一致性损失 -----
+        # 利用UNet生成的边界信息
+        if hasattr(self.generator, 'boundary_maps') and self.generator.boundary_maps:
+            # 提取最后一级边界图
+            if 'skip1' in self.generator.boundary_maps:
+                boundary_map = self.generator.boundary_maps['skip1']
+                
+                # 计算真实标签的边缘
+                real_edges = torch.abs(F.conv2d(
+                    real_labels, 
+                    torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], 
+                                dtype=torch.float32).view(1, 1, 3, 3).to(real_labels.device),
+                    padding=1
+                ))
+                
+                # 计算边界一致性损失 - 鼓励边界与真实标签边缘对齐
+                boundary_loss = F.binary_cross_entropy(
+                    boundary_map,
+                    torch.sigmoid(5.0 * real_edges)  # 放大真实边缘并应用sigmoid
+                )
+                
+                # 边界损失权重
+                boundary_weight = 0.05
+            else:
+                boundary_loss = torch.tensor(0.0, device=gen_seg.device)
+                boundary_weight = 0.0
+        else:
+            boundary_loss = torch.tensor(0.0, device=gen_seg.device)
+            boundary_weight = 0.0
+        
+        # 汇总所有损失
+        total_loss = (
+            gen_loss + 
+            self.adv_weight * adv_loss + 
+            size_penalty + 
+            variance_penalty + 
+            boundary_weight * boundary_loss
+        )
         
         return {
             'total': total_loss,
             'gen': gen_loss,
             'adv': adv_loss,
             'size_penalty': size_penalty,
-            'variance_penalty': variance_penalty
+            'variance_penalty': variance_penalty,
+            'boundary': boundary_loss if boundary_weight > 0 else torch.tensor(0.0, device=gen_seg.device)
         }
         
     def _compute_tad_sizes(self, segmentation):
