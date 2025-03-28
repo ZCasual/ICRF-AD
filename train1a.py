@@ -11,6 +11,7 @@ from net1a import (
     AdversarialTAD
 )
 import torch.nn.functional as F
+import math
 
 class TADPipelineAdversarial(TADBaseConfig):
     """TAD检测训练流程(支持贝叶斯U-Net与自我反思机制)"""
@@ -46,10 +47,18 @@ class TADPipelineAdversarial(TADBaseConfig):
         # 初始化模型 - 支持贝叶斯选项
         self.adv_net = AdversarialTAD(freeze_ratio=0.75, use_bayesian=self.use_bayesian).to(self.device)
         
+        # 初始学习率
+        initial_lr_gen = 1e-7
+        initial_lr_disc = 2e-10
+        
+        # 目标学习率
+        target_lr_gen = 1e-5
+        target_lr_disc = 2e-7
+        
         # 使用分组优化器，为判别器设置更低的学习率
         optimizer_params = [
-            {'params': self.adv_net.generator.parameters(), 'lr': 5e-3},
-            {'params': self.adv_net.discriminator.parameters(), 'lr': 2e-6}  # 判别器学习率降低5倍
+            {'params': self.adv_net.generator.parameters(), 'lr': initial_lr_gen},
+            {'params': self.adv_net.discriminator.parameters(), 'lr': initial_lr_disc}
         ]
         self.optimizer = torch.optim.AdamW(optimizer_params)
         
@@ -69,6 +78,17 @@ class TADPipelineAdversarial(TADBaseConfig):
             'total': AverageMeter('总损失')
         }
         
+        # 学习率调度参数
+        warmup_steps = 10  # 前10步保持初始学习率
+        
+        # 计算总步数
+        total_steps = self.num_epochs * len(tiles)
+        # 计算余弦退火截止步数 (总进度的60%)
+        cosine_end_step = int(0.6 * total_steps)
+        
+        # 当前步数计数器
+        global_step = 0
+        
         # 开始训练循环
         for epoch in range(self.num_epochs):
             # 重置损失记录器
@@ -80,6 +100,41 @@ class TADPipelineAdversarial(TADBaseConfig):
             
             # 为每个图块执行一次前向和后向传播
             for batch_idx, tile in pbar:
+                # 学习率调度策略
+                # 1. 前10步保持初始学习率
+                if global_step < warmup_steps:
+                    current_lr_gen = initial_lr_gen
+                    current_lr_disc = initial_lr_disc
+                    lr_phase = "初始"
+                
+                # 2. 从第11步到总进度的60%使用余弦退火
+                elif global_step < cosine_end_step:
+                    # 计算余弦退火的当前进度 [0,1]
+                    progress = (global_step - warmup_steps) / (cosine_end_step - warmup_steps)
+                    # 余弦退火公式
+                    cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+                    
+                    # 计算当前学习率
+                    current_lr_gen = target_lr_gen + cosine_factor * (initial_lr_gen - target_lr_gen)
+                    current_lr_disc = target_lr_disc + cosine_factor * (initial_lr_disc - target_lr_disc)
+                    lr_phase = "余弦"
+                
+                # 3. 从总进度的60%到结束保持目标学习率
+                else:
+                    current_lr_gen = target_lr_gen
+                    current_lr_disc = target_lr_disc
+                    lr_phase = "稳定"
+                
+                # 更新优化器中的学习率
+                for i, param_group in enumerate(self.optimizer.param_groups):
+                    if i == 0:  # 生成器参数组
+                        param_group['lr'] = current_lr_gen
+                    else:  # 判别器参数组
+                        param_group['lr'] = current_lr_disc
+                
+                # 显示当前学习率信息
+                lr_info = f"{lr_phase}[G={current_lr_gen:.1e},D={current_lr_disc:.1e}]"
+                
                 self.optimizer.zero_grad()
                 
                 # 前向传播
@@ -101,13 +156,17 @@ class TADPipelineAdversarial(TADBaseConfig):
                 for k, v in losses.items():
                     loss_meters[k].update(v.item())
                 
-                # 更新tqdm进度条显示当前损失
+                # 更新tqdm进度条显示当前损失和学习率
                 pbar.set_postfix({
                     'Gen': f'{loss_meters["gen"].avg:.4f}',
                     'Adv': f'{loss_meters["adv"].avg:.4f}',
                     'Disc': f'{loss_meters["disc"].avg:.4f}',
-                    'Total': f'{loss_meters["total"].avg:.4f}'
+                    'Total': f'{loss_meters["total"].avg:.4f}',
+                    'LR': lr_info
                 })
+                
+                # 更新全局步数
+                global_step += 1
             
             # 第一个epoch完成后立即进行可视化
             if epoch == 0:
