@@ -9,7 +9,7 @@ import math
 
 # 导入模块
 from tad_modules import (LowRank, GeometricFeatureExtractor, AVIT, 
-                        EdgeAwareBiLSTM, SimplifiedUNet, 
+                        EdgeAwareBiLSTM, SimplifiedUNet, BayesianUNet,
                         find_chromosome_files, fill_hic)  # 从模块导入函数
 
 # 创建基础配置类
@@ -68,14 +68,17 @@ class TADBaseConfig:
 
 class AdversarialTAD(nn.Module):
     """对抗学习框架（完整实现）"""
-    def __init__(self, embed_dim=64, freeze_ratio=0.75):
+    def __init__(self, embed_dim=64, freeze_ratio=0.75, use_bayesian=True):
         super().__init__()
-        # 生成器 (分割网络)
-        self.generator = SimplifiedUNet(1, 1, adv_mode=True)
+        # 生成器 (分割网络) - 支持贝叶斯U-Net
+        if use_bayesian:
+            self.generator = BayesianUNet(1, 1, adv_mode=True)
+        else:
+            self.generator = SimplifiedUNet(1, 1, adv_mode=True)
         
         # 判别器 (边界检测+真实性判断)
         self.discriminator = EdgeAwareBiLSTM(
-            input_dim=1,  # 输入为生成器的单通道输出
+            input_dim=2 if use_bayesian else 1,  # 贝叶斯模型额外提供不确定性通道
             hidden_dim=32,
             with_classifier=True
         )
@@ -87,6 +90,9 @@ class AdversarialTAD(nn.Module):
         # 对抗训练参数
         self.adv_weight = 0.1
         
+        # 是否为贝叶斯模式
+        self.is_bayesian = use_bayesian
+    
     def _freeze_parameters(self, ratio):
         """智能冻结机制，优先冻结深层参数"""
         params = []
@@ -122,27 +128,81 @@ class AdversarialTAD(nn.Module):
         # 确保输入连续
         matrix = matrix.contiguous()
         
-        # 生成器前向处理
-        gen_seg = self.generator(matrix)  # [B,1,H,W]
+        # 生成器前向处理 - 支持贝叶斯输出
+        if self.is_bayesian:
+            gen_seg, uncertainty = self.generator(matrix, return_uncertainty=True)
+            # 将分割和不确定性连接为2通道输出
+            gen_output = torch.cat([gen_seg, uncertainty], dim=1)  # [B,2,H,W]
+        else:
+            gen_seg = self.generator(matrix)  # [B,1,H,W]
+            gen_output = gen_seg
         
         # 确保生成器输出连续
-        gen_seg = gen_seg.contiguous()
+        gen_output = gen_output.contiguous()
         
         # 直接处理完整输出，避免不必要的分块
-        B, C, H, W = gen_seg.shape
-        
-        # 整形为序列 [B,1,H*W]
-        seq_features = gen_seg.view(B, C, H*W)
-        seq_features = seq_features.contiguous()  # 显式确保连续
+        B = gen_output.shape[0]
         
         # 判别器处理
         _, _, real_prob = self.discriminator(matrix)
-        _, _, fake_prob = self.discriminator(seq_features, is_sequence=True)
+        
+        # 判别器处理生成结果
+        _, _, fake_prob = self.discriminator(gen_output, is_sequence=False)
+        
+        if self.is_bayesian:
+            return {
+                'gen_seg': gen_seg,
+                'uncertainty': uncertainty,
+                'real_prob': real_prob,
+                'fake_prob': fake_prob
+            }
+        else:
+            return {
+                'gen_seg': gen_seg,
+                'real_prob': real_prob,
+                'fake_prob': fake_prob
+            }
+    
+    def _compute_losses(self, outputs, real_labels):
+        """支持贝叶斯不确定性的损失计算"""
+        # 生成器损失
+        gen_loss = F.binary_cross_entropy(outputs['gen_seg'], real_labels)
+        
+        # 不确定性引导损失（如果可用）
+        if 'uncertainty' in outputs:
+            # 不确定性引导：高不确定性区域增加权重
+            uncertainty_weight = 1.0 + torch.sigmoid(outputs['uncertainty'])
+            weighted_loss = gen_loss * uncertainty_weight
+            gen_loss = weighted_loss.mean()
+            
+            # 如果是贝叶斯模型，加入KL散度正则化
+            if hasattr(self.generator, 'get_kl_divergence'):
+                kl_div = self.generator.get_kl_divergence()
+                kl_weight = 1.0 / real_labels.shape[0]  # 按批次大小缩放
+                gen_loss = gen_loss + kl_weight * kl_div
+        
+        # 对抗损失（生成器欺骗判别器）
+        adv_loss = F.binary_cross_entropy(
+            outputs['fake_prob'], 
+            torch.ones_like(outputs['fake_prob'])
+        )
+        
+        # 判别器损失
+        real_loss = F.binary_cross_entropy(
+            outputs['real_prob'],
+            torch.ones_like(outputs['real_prob'])
+        )
+        fake_loss = F.binary_cross_entropy(
+            outputs['fake_prob'],
+            torch.zeros_like(outputs['fake_prob'])
+        )
+        disc_loss = (real_loss + fake_loss) / 2
         
         return {
-            'gen_seg': gen_seg,
-            'real_prob': real_prob,
-            'fake_prob': fake_prob
+            'total': gen_loss + self.adv_weight * adv_loss + disc_loss,
+            'gen': gen_loss,
+            'adv': adv_loss,
+            'disc': disc_loss
         }
 
     def _merge_results(self, results):

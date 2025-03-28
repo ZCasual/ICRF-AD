@@ -25,76 +25,79 @@ class EdgeAwareBiLSTM(nn.Module):
         # 边界概率判别器 - 输出边界概率
         self.boundary_classifier = nn.Sequential(
             nn.Linear(hidden_dim*2, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()  # 使用Sigmoid确保输出为概率值
+            nn.Sigmoid()
         )
         
-        # 新增真实性分类器
-        self.real_classifier = nn.Sequential(
-            nn.Linear(hidden_dim*2, 1),
-            nn.Sigmoid()
-        ) if with_classifier else None
+        # 可选：真实性分类器 - 判断序列是否真实
+        self.real_classifier = None
+        if with_classifier:
+            self.real_classifier = nn.Sequential(
+                nn.Linear(hidden_dim*2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+                nn.Sigmoid()
+            )
     
-    def forward(self, features, regions=None, hic_matrix=None, is_sequence=False):
-        """
-        分析特征并输出边界概率
-        
+    def forward(self, x, is_sequence=False):
+        """前向传播函数
         Args:
-            features: 特征张量 [B, C, H, W] 或 [B, L, D]
-            regions: 可选的区域列表 [(start, end, type), ...]
-            hic_matrix: 可选的Hi-C矩阵
-            is_sequence: 标识输入是否为生成器产生的序列
+            x: 输入张量，可以是:
+               - 序列形式 [B, C, L] - is_sequence=True
+               - 或图像形式 [B, C, H, W] - is_sequence=False
+            is_sequence: 指示输入是否已经是序列格式
             
         Returns:
-            boundary_probs: 边界概率 [B, L]
-            boundary_adj: 边界调整建议 [B, L]
-            real_prob: 真实性概率
+            tuple: (边界概率, 边界调整建议, 真实性评分)
         """
-        # 首先确保输入数据连续性
-        if not features.is_contiguous():
-            features = features.contiguous()
+        # 确保输入是张量
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"输入必须是张量，得到: {type(x)}")
+            
+        # 获取批次大小
+        batch_size = x.shape[0]
         
-        # 简化处理逻辑，避免频繁维度转换
-        if is_sequence:  # 序列输入 [B,1,L]
-            # 直接转换为LSTM期望的格式 [B,L,D]
-            B, C, L = features.shape
-            features_flat = features.transpose(1, 2)  # [B,L,C]
-        elif features.dim() == 4:  # 4D输入 [B,C,H,W]
-            B, C, H, W = features.shape
-            features_flat = features.view(B, C, H*W).transpose(1, 2)  # [B,H*W,C]
-        elif features.dim() == 3 and not is_sequence:  # 3D非序列输入 [B,H,W]
-            B, H, W = features.shape
-            features_flat = features.reshape(B, H*W, 1)  # [B,H*W,1]
-        elif features.dim() == 2:  # 2D输入 [H,W]
-            features = features.unsqueeze(0)  # [1,H,W]
-            H, W = features.shape[1:]
-            features_flat = features.reshape(1, H*W, 1)  # [1,H*W,1]
+        # 1. 将输入处理为序列
+        if not is_sequence:
+            # 处理2D输入 [B, C, H, W]
+            if x.dim() == 4:
+                B, C, H, W = x.shape
+                # 贝叶斯模型输入可能有多个通道 (包括不确定性)
+                
+                # 将2D图像转为1D序列 - 注意这里的修改
+                if C > 1:
+                    # 只使用第一个通道（分割结果）
+                    x_seq = x[:, 0].view(B, 1, H*W)  # [B, 1, H*W]
+                else:
+                    x_seq = x.view(B, C, H*W)  # [B, C, H*W]
+                    
+                seq_len = H*W
+            else:
+                raise ValueError(f"当is_sequence=False时，预期维度为4，得到{x.dim()}")
         else:
-            raise ValueError(f"不支持的输入维度: {features.shape}")
+            # 输入已经是序列 [B, C, L]
+            if x.dim() != 3:
+                raise ValueError(f"当is_sequence=True时，预期维度为3，得到{x.dim()}")
+            B, C, seq_len = x.shape
+            x_seq = x
         
-        # 确保LSTM输入连续
-        features_flat = features_flat.contiguous()
+        # 2. 调整维度顺序为 [B, L, C]
+        x_seq = x_seq.permute(0, 2, 1)  # [B, L, C]
         
-        # 投影层处理
-        projected = self.projection(features_flat)  # [B,L,hidden_dim]
+        # 3. 线性投影 - 将不同维度的输入统一转为hidden_dim
+        # 检查输入通道数是否与投影层匹配
+        if x_seq.shape[2] != self.input_dim:
+            # 如果通道数不匹配，创建新的投影层
+            self.projection = nn.Linear(x_seq.shape[2], self.hidden_dim).to(x_seq.device)
         
-        # LSTM处理 (明确检查输入连续性)
-        lstm_out, _ = self.bilstm(projected)  # [B,L,hidden_dim*2]
+        projected = self.projection(x_seq)  # [B, L, hidden_dim]
         
-        # 计算所有位置的边界概率
-        batch_size, seq_len, _ = lstm_out.shape
-        boundary_probs_chunk = torch.zeros(batch_size, seq_len, device=projected.device)
+        # 4. BiLSTM处理
+        lstm_out, _ = self.bilstm(projected)  # [B, L, hidden_dim*2]
         
-        for i in range(seq_len):
-            boundary_probs_chunk[:, i] = self.boundary_classifier(lstm_out[:, i]).squeeze(-1)
-        
-        # 为序列起始和结束位置增强边界概率信号
-        boundary_probs_chunk[:, 0] = boundary_probs_chunk[:, 0] * 1.2  # 增强左边界
-        boundary_probs_chunk[:, -1] = boundary_probs_chunk[:, -1] * 1.2  # 增强右边界
-        
-        # 约束概率范围在[0,1]之间，同时确保精度正确
-        boundary_probs_chunk = torch.clamp(boundary_probs_chunk, 0.0, 1.0)
+        # 5. 边界概率预测
+        boundary_probs_chunk = self.boundary_classifier(lstm_out).squeeze(-1)  # [B, L]
         
         # 生成边界调整建议 (基于概率梯度)
         boundary_adj_chunk = torch.zeros_like(boundary_probs_chunk)
@@ -119,6 +122,5 @@ class EdgeAwareBiLSTM(nn.Module):
         
         boundary_probs = boundary_probs_chunk
         boundary_adj = boundary_adj_chunk
-        real_prob = real_prob
         
         return boundary_probs, boundary_adj, real_prob
