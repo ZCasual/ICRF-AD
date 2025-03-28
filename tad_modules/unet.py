@@ -202,28 +202,32 @@ class BayesianUNet(nn.Module):
             # 无内部优化时的输出
             output = final_out * 0.7 + enhanced_edge * 0.3
         
-        # 不确定性估计（仅在贝叶斯模式）
-        if hasattr(self, 'uncertainty_estimator') and self.training:
-            # 修复：确保使用.detach()隔离不需要传播梯度的路径
+        # 不确定性估计（不论训练模式）
+        uncertainty = None
+        if return_uncertainty or (hasattr(self, 'uncertainty_estimator') and self.training and self.adv_mode):
+            # 使用no_grad()执行蒙特卡洛采样，避免额外的内存消耗
             with torch.no_grad():
-                mean_pred, uncertainty = self.uncertainty_estimator(dec1.detach(), self.mc_samples)
+                mean_pred, uncertainty = self.uncertainty_estimator(dec1.detach(), n_samples)
             
-            # 不确定性引导的输出调整 - 保持计算图连接
-            # 高不确定性区域更依赖边缘特征
-            uncertainty_weight = torch.sigmoid(uncertainty * 5)
-            uncertainty_term = enhanced_edge * (uncertainty_weight * 0.3)
-            output = output * (1 - uncertainty_weight * 0.3) + uncertainty_term
-            
-            # 如果是对抗训练模式，返回不确定性
-            if self.adv_mode:
-                return output, uncertainty
+            # 仅在训练时使用不确定性调整输出
+            if self.training:
+                # 不确定性引导的输出调整 - 保持计算图连接
+                uncertainty_weight = torch.sigmoid(uncertainty * 5)
+                uncertainty_term = enhanced_edge * (uncertainty_weight * 0.3)
+                output = output * (1 - uncertainty_weight * 0.3) + uncertainty_term
         
-        # 避免使用.to()操作，可能会破坏梯度流
-        # 如果必须转换类型，使用.type_as()
+        # 确保输出类型一致
         if output.dtype != x.dtype:
             output = output.type_as(x)
         
-        return output
+        # 关键修复：确保在return_uncertainty=True时始终返回不确定性
+        if return_uncertainty:
+            # 如果uncertainty为None，创建零张量
+            if uncertainty is None:
+                uncertainty = torch.zeros_like(output)
+            return output, uncertainty
+        else:
+            return output
     
     def get_kl_divergence(self):
         """获取网络中所有贝叶斯层的KL散度"""

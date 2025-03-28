@@ -254,7 +254,7 @@ class BoundaryRefiner(nn.Module):
         if not initial_segmentation.requires_grad:
             initial_segmentation.requires_grad_(True)
         
-        # 初始分割结果
+        # 初始分割结果 - 修正缩进
         current_seg = initial_segmentation.clone()
         
         # 循环优化，避免存储所有中间状态
@@ -272,7 +272,7 @@ class BoundaryRefiner(nn.Module):
             if i < self.iterations - 1:
                 # 计算梯度
                 grads = torch.autograd.grad(reward, current_seg, 
-                                           create_graph=False, retain_graph=False)[0]
+                                          create_graph=False, retain_graph=False)[0]
                 
                 # 分离当前状态并更新
                 current_seg = current_seg.detach()
