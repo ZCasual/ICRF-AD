@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 import numpy as np
 from .bayesian_layers import BayesianConvBlock
-from .self_reflection import SelfReflectionModule, UncertaintyEstimator
+from .self_reflection import SelfReflectionModule, UncertaintyEstimator, DifferentiableCanny
 from .internal_reward import TADBoundaryReward, BoundaryRefiner
 
 class BayesianUNet(nn.Module):
@@ -115,6 +115,12 @@ class BayesianUNet(nn.Module):
                 nn.InstanceNorm2d(16),
                 nn.ReLU()
             )
+        
+        # 添加Canny边缘检测器
+        self.canny_detector = DifferentiableCanny(
+            low_threshold=0.1, 
+            high_threshold=0.3
+        )
     
     def forward(self, x, return_uncertainty=False, n_samples=0):
         """前向传播，支持不确定性估计"""
@@ -149,8 +155,11 @@ class BayesianUNet(nn.Module):
         # 不再进行连接，直接传入dec1
         dec1 = self.dec1(dec1_up)
         
-        # TAD边界增强
+        # 边缘检测增强
+        canny_edges, _ = self.canny_detector(x)
         edge_map = self.edge_enhancement(dec1)
+        # 结合Canny边缘和预测边缘
+        enhanced_edge = 0.6 * edge_map + 0.4 * canny_edges
         
         if return_uncertainty:
             # 使用不确定性估计器 - 多次采样
@@ -158,7 +167,7 @@ class BayesianUNet(nn.Module):
             final_out = self.final(final_out)
             
             # 增强边界的分割结果
-            enhanced_out = final_out * 0.7 + edge_map * 0.3
+            enhanced_out = final_out * 0.7 + enhanced_edge * 0.3
             enhanced_out = torch.clamp(enhanced_out, 0.0, 1.0)
             
             # 在解码路径添加扰动
@@ -172,7 +181,7 @@ class BayesianUNet(nn.Module):
             final_out = self.final(dec1)
             
             # 增强边界的分割结果
-            enhanced_out = final_out * 0.7 + edge_map * 0.3
+            enhanced_out = final_out * 0.7 + enhanced_edge * 0.3
             enhanced_out = torch.clamp(enhanced_out, 0.0, 1.0)
             
             # 确保输出类型与输入一致（支持混合精度训练）

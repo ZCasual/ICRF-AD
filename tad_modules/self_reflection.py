@@ -4,6 +4,121 @@ import torch.nn.functional as F
 import math
 import numpy as np
 
+class DifferentiableCanny(nn.Module):
+    """可微分Canny边缘检测器
+    
+    相比传统Canny算法，此版本所有操作均为可微分，
+    支持反向传播以便在神经网络中端到端训练。
+    """
+    def __init__(self, low_threshold=0.1, high_threshold=0.3, kernel_size=3, sigma=1.0):
+        super().__init__()
+        self.low_threshold = low_threshold
+        self.high_threshold = high_threshold
+        
+        # 创建高斯平滑卷积核
+        self.kernel_size = kernel_size
+        sigma = sigma if sigma else (kernel_size - 1) / 6
+        
+        # 生成高斯核
+        x_coord = torch.arange(kernel_size)
+        x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+        
+        mean = (kernel_size - 1) / 2.
+        variance = sigma ** 2
+        
+        # 计算高斯核
+        gaussian_kernel = torch.exp(
+            -torch.sum((xy_grid - mean) ** 2., dim=-1) / (2 * variance)
+        )
+        gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+        
+        # 将高斯核转换为适用于nn.Conv2d的形式
+        self.gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+        
+        # Sobel卷积核
+        self.sobel_kernel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        self.sobel_kernel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        # 注册卷积核为缓冲区，不作为模型参数
+        self.register_buffer('gaussian', self.gaussian_kernel)
+        self.register_buffer('sobel_x', self.sobel_kernel_x)
+        self.register_buffer('sobel_y', self.sobel_kernel_y)
+        
+    def forward(self, x):
+        """前向传播实现可微分Canny检测"""
+        # 确保输入是4D张量 [B,C,H,W]
+        input_dim = x.dim()
+        if input_dim == 3:
+            x = x.unsqueeze(0)  # 添加批次维度
+        
+        # 如果输入是多通道，转为单通道
+        if x.shape[1] > 1:
+            x = x.mean(dim=1, keepdim=True)
+        
+        # 步骤1: 高斯平滑
+        smoothed = F.conv2d(x, self.gaussian, padding=self.kernel_size//2)
+        
+        # 步骤2: 计算梯度
+        grad_x = F.conv2d(smoothed, self.sobel_x, padding=1)
+        grad_y = F.conv2d(smoothed, self.sobel_y, padding=1)
+        
+        # 步骤3: 计算梯度幅度和方向
+        grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+        grad_direction = torch.atan2(grad_y, grad_x)
+        
+        # 步骤4: 非最大抑制 (可微分版本)
+        # 将方向量化为0, 45, 90, 135度
+        directions = torch.round(grad_direction * (4 / math.pi)) % 4
+        
+        # 使用可微分的近似代替硬阈值的非最大抑制
+        nms_result = grad_magnitude.clone()
+        
+        # 通过内插和卷积近似非最大抑制
+        for i in range(4):  # 4个方向: 0, 45, 90, 135度
+            mask = (directions == i).float()
+            
+            # 获取每个方向上的偏移
+            if i == 0:  # 0度 - 水平
+                offset_pos = F.pad(grad_magnitude[:, :, :, 1:], (0, 1, 0, 0))
+                offset_neg = F.pad(grad_magnitude[:, :, :, :-1], (1, 0, 0, 0))
+            elif i == 1:  # 45度 - 对角线
+                offset_pos = F.pad(grad_magnitude[:, :, 1:, 1:], (0, 1, 0, 1))
+                offset_neg = F.pad(grad_magnitude[:, :, :-1, :-1], (1, 0, 1, 0))
+            elif i == 2:  # 90度 - 垂直
+                offset_pos = F.pad(grad_magnitude[:, :, 1:, :], (0, 0, 0, 1))
+                offset_neg = F.pad(grad_magnitude[:, :, :-1, :], (0, 0, 1, 0))
+            else:  # 135度 - 对角线
+                offset_pos = F.pad(grad_magnitude[:, :, 1:, :-1], (1, 0, 0, 1))
+                offset_neg = F.pad(grad_magnitude[:, :, :-1, 1:], (0, 1, 1, 0))
+            
+            # 柔和的非最大抑制
+            is_max = (grad_magnitude > offset_pos).float() * (grad_magnitude > offset_neg).float()
+            nms_result = nms_result * (1 - mask + mask * is_max)
+        
+        # 步骤5: 滞后阈值处理
+        # 使用Sigmoid函数代替硬阈值
+        low_mask = torch.sigmoid((nms_result - self.low_threshold) * 10)
+        high_mask = torch.sigmoid((nms_result - self.high_threshold) * 10)
+        
+        # 返回原始维度
+        if input_dim == 3:
+            nms_result = nms_result.squeeze(0)
+            low_mask = low_mask.squeeze(0)
+            high_mask = high_mask.squeeze(0)
+        
+        return nms_result * high_mask, nms_result * low_mask
+
 class SelfReflectionModule(nn.Module):
     """自我反思模块，评估预测质量并提供反馈"""
     def __init__(self, feature_channels, reduction=8):
@@ -35,7 +150,7 @@ class SelfReflectionModule(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # 记录历史预测用于自我评估
+        # 预测历史跟踪
         self.register_buffer('prediction_history', None)
         self.history_len = 3
         
@@ -117,7 +232,7 @@ class SelfReflectionModule(nn.Module):
                     align_corners=False
                 )
             
-            # 基于不确定性的自适应融合
+            # 基于不确定性的自适应特征融合
             fusion_weight = 1.0 - uncertainty_map  # 不确定区域减少跳跃连接贡献
             combined_features = enhanced_features + skip_features * fusion_weight
         else:
