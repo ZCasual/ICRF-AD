@@ -272,4 +272,71 @@ class UncertaintyEstimator(nn.Module):
         mean_prediction = torch.mean(predictions, dim=0)  # [B, C, H, W]
         uncertainty = torch.var(predictions, dim=0).sum(dim=1, keepdim=True)  # [B, 1, H, W]
         
-        return mean_prediction, uncertainty 
+        return mean_prediction, uncertainty
+
+class BiFPNBlock(nn.Module):
+    """双向特征金字塔网络块 - 优化多尺度特征融合"""
+    def __init__(self, feature_size, eps=1e-4):
+        super(BiFPNBlock, self).__init__()
+        self.epsilon = eps
+        
+        # 自适应权重（可学习）
+        self.w1 = nn.Parameter(torch.ones(2, dtype=torch.float32))
+        self.w2 = nn.Parameter(torch.ones(3, dtype=torch.float32))
+        
+        # 特征处理卷积
+        self.conv_up = nn.Sequential(
+            nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1, groups=feature_size),
+            nn.BatchNorm2d(feature_size),
+            nn.Conv2d(feature_size, feature_size, kernel_size=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv_down = nn.Sequential(
+            nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1, groups=feature_size),
+            nn.BatchNorm2d(feature_size),
+            nn.Conv2d(feature_size, feature_size, kernel_size=1),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, p3, p4, p5):
+        """
+        多尺度特征融合
+        p3, p4, p5: 不同尺度的特征 (小到大)
+        """
+        # 权重归一化
+        w1 = F.relu(self.w1)
+        w1 = w1 / (torch.sum(w1, dim=0) + self.epsilon)
+        
+        w2 = F.relu(self.w2)
+        w2 = w2 / (torch.sum(w2, dim=0) + self.epsilon)
+        
+        # 自顶向下路径 (从高层特征到低层特征)
+        p5_td = p5
+        
+        # P4自顶向下: 结合P5上采样和P4
+        p4_in = w1[0] * p4 + w1[1] * F.interpolate(p5_td, size=p4.shape[2:], 
+                                                mode='bilinear', align_corners=False)
+        p4_td = self.conv_up(p4_in)
+        
+        # P3自顶向下: 结合P4上采样和P3
+        p3_in = w1[0] * p3 + w1[1] * F.interpolate(p4_td, size=p3.shape[2:], 
+                                               mode='bilinear', align_corners=False)
+        p3_td = self.conv_up(p3_in)
+        
+        # 自底向上路径 (从低层特征到高层特征)
+        p3_out = p3_td
+        
+        # P4自底向上: 结合P3下采样, P4原始输入, P4自顶向下结果
+        p4_out_size = p4.shape[2:]
+        p3_down = F.adaptive_max_pool2d(p3_out, output_size=p4_out_size)
+        p4_out = w2[0] * p4 + w2[1] * p4_td + w2[2] * p3_down
+        p4_out = self.conv_down(p4_out)
+        
+        # P5自底向上: 结合P4下采样, P5
+        p5_out_size = p5.shape[2:]
+        p4_down = F.adaptive_max_pool2d(p4_out, output_size=p5_out_size)
+        p5_out = w2[0] * p5 + w2[1] * p5_td + w2[2] * p4_down
+        p5_out = self.conv_down(p5_out)
+        
+        return p3_out, p4_out, p5_out 

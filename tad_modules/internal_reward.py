@@ -249,37 +249,39 @@ class BoundaryRefiner(nn.Module):
         self.threshold = early_stop_threshold
         
     def forward(self, initial_segmentation, hic_matrix, features):
-        """迭代优化TAD边界 - 内存优化版本
+        """迭代优化TAD边界 - 内存优化版本"""
+        # 确保输入需要梯度
+        if not initial_segmentation.requires_grad:
+            initial_segmentation.requires_grad_(True)
         
-        使用梯度累积而非存储中间状态，更适合大分辨率图像
-        """
-        # 使用分离的计算流，避免影响主反向传播
-        with torch.no_grad():
-            # 初始分割结果
-            current_seg = initial_segmentation.clone()
+        # 初始分割结果
+        current_seg = initial_segmentation.clone()
+        
+        # 循环优化，避免存储所有中间状态
+        reward_history = []
+        
+        for i in range(self.iterations):
+            # 设置当前分割需要梯度
+            current_seg.requires_grad_(True)
             
-            # 循环优化，避免存储所有中间状态
-            reward_history = []
+            # 前向传播计算激励分数
+            reward, components = self.reward(current_seg, hic_matrix, features)
+            reward_history.append(components)
             
-            for i in range(self.iterations):
-                # 设置当前分割需要梯度
-                current_seg.requires_grad_(True)
+            # 如果不是最后一轮，计算梯度并更新
+            if i < self.iterations - 1:
+                # 计算梯度
+                grads = torch.autograd.grad(reward, current_seg, 
+                                           create_graph=False, retain_graph=False)[0]
                 
-                # 前向传播计算激励分数
-                reward, components = self.reward(current_seg, hic_matrix, features)
-                reward_history.append(components)
+                # 分离当前状态并更新
+                current_seg = current_seg.detach()
+                current_seg = current_seg - self.lr * grads
                 
-                # 如果不是最后一轮，计算梯度并更新
-                if i < self.iterations - 1:
-                    # 计算梯度
-                    grads = torch.autograd.grad(reward, current_seg, 
-                                                create_graph=False, retain_graph=False)[0]
-                    
-                    # 分离当前状态并更新
-                    current_seg = current_seg.detach()
-                    current_seg = current_seg - self.lr * grads
-                    
-                    # 确保值域在[0,1]
-                    current_seg = torch.clamp(current_seg, 0.0, 1.0)
-                    
-        return current_seg, reward_history 
+                # 确保值域在[0,1]
+                current_seg = torch.clamp(current_seg, 0.0, 1.0)
+        
+        # 确保最终结果与输入连接梯度流
+        output = current_seg * 1.0  # 乘以1.0保留梯度连接
+                
+        return output, reward_history 

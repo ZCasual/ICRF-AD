@@ -18,6 +18,17 @@ class BayesianUNet(nn.Module):
         self.adv_mode = adv_mode
         self.use_internal_optimization = use_internal_optimization
         
+        # 初始化Canny边缘检测器
+        self.canny_detector = DifferentiableCanny(
+            low_threshold=0.1, 
+            high_threshold=0.3,
+            sigma=1.2
+        )
+        
+        # 边缘融合权重（可学习）
+        self.edge_weight = nn.Parameter(torch.tensor(0.4))
+        self.canny_weight = nn.Parameter(torch.tensor(0.3))
+        
         # 编码器 (下采样路径)
         self.enc1 = nn.Sequential(
             BayesianConvBlock(input_channels, 16),
@@ -115,12 +126,6 @@ class BayesianUNet(nn.Module):
                 nn.InstanceNorm2d(16),
                 nn.ReLU()
             )
-        
-        # 添加Canny边缘检测器
-        self.canny_detector = DifferentiableCanny(
-            low_threshold=0.1, 
-            high_threshold=0.3
-        )
     
     def forward(self, x, return_uncertainty=False, n_samples=0):
         """前向传播，支持不确定性估计"""
@@ -128,18 +133,25 @@ class BayesianUNet(nn.Module):
         if n_samples <= 0:
             n_samples = 1 if not return_uncertainty else self.mc_samples
         
+        # 首先进行Canny边缘检测 - 在torch.no_grad()外部执行以保留梯度流
+        canny_edges, _ = self.canny_detector(x)
+        
         # 编码器路径
         enc1 = self.enc1(x)
         enc2 = self.enc2(enc1)
         enc3 = self.enc3(enc2)
         enc4 = self.enc4(enc3)
         
-        # 自我反思 - 编码器特征
-        enc3_refined, unc3 = self.reflect3(enc3)
+        # 应用自我反思模块优化特征
+        if hasattr(self, 'reflect3'):
+            enc3_refined, unc3 = self.reflect3(enc3)
+        else:
+            enc3_refined = enc3
+            unc3 = torch.zeros(enc3.shape[0], 1, enc3.shape[2], enc3.shape[3], device=enc3.device)
         
-        # 解码器路径与跳跃连接
-        dec4_up = F.interpolate(enc4, size=enc3.shape[2:], mode='bilinear', align_corners=False)
-        dec4_cat = torch.cat([dec4_up, enc3], dim=1)
+        # 解码器路径（上采样）
+        dec4_up = F.interpolate(enc4, size=enc3_refined.shape[2:], mode='bilinear', align_corners=False)
+        dec4_cat = torch.cat([dec4_up, enc3_refined], dim=1)
         dec4 = self.dec4(dec4_cat)
         
         dec3_up = F.interpolate(dec4, size=enc2.shape[2:], mode='bilinear', align_corners=False)
@@ -150,49 +162,68 @@ class BayesianUNet(nn.Module):
         dec2_cat = torch.cat([dec2_up, enc1], dim=1)
         dec2 = self.dec2(dec2_cat)
         
-        # 修复：不再连接enc1，只使用dec2上采样结果
-        dec1_up = F.interpolate(dec2, size=x.shape[2:], mode='bilinear', align_corners=False)
-        # 不再进行连接，直接传入dec1
-        dec1 = self.dec1(dec1_up)
+        # 最终解码层 - 不再拼接额外特征
+        dec1 = self.dec1(F.interpolate(dec2, size=x.shape[2:], mode='bilinear', align_corners=False))
         
-        # 边缘检测增强
-        canny_edges, _ = self.canny_detector(x)
+        # TAD边界增强
         edge_map = self.edge_enhancement(dec1)
-        # 结合Canny边缘和预测边缘
-        enhanced_edge = 0.6 * edge_map + 0.4 * canny_edges
         
-        if return_uncertainty:
-            # 使用不确定性估计器 - 多次采样
-            final_out, uncertainty = self.uncertainty_estimator(dec1, n_samples)
-            final_out = self.final(final_out)
+        # 边缘融合 - 结合预测边缘和Canny边缘
+        # 确保canny_edges维度与edge_map一致
+        if canny_edges.shape != edge_map.shape:
+            canny_edges = F.interpolate(canny_edges, size=edge_map.shape[2:], 
+                                       mode='bilinear', align_corners=False)
+        
+        # 修复：使用clone()保留梯度流
+        enhanced_edge = torch.sigmoid(
+            self.edge_weight * edge_map + self.canny_weight * canny_edges
+        ).clone()
+        
+        # 最终分割输出
+        final_out = self.final(dec1)
+        
+        # 如果使用内部边界优化
+        if self.use_internal_optimization and hasattr(self, 'boundary_refiner'):
+            # 提取特征用于边界精化
+            features = dec1  # 使用解码器最后层特征
             
-            # 增强边界的分割结果
-            enhanced_out = final_out * 0.7 + enhanced_edge * 0.3
-            enhanced_out = torch.clamp(enhanced_out, 0.0, 1.0)
+            # 修复：确保精化过程不会切断梯度流
+            with torch.enable_grad():  # 确保梯度计算
+                # 精化边界
+                refined_out, reward_history = self.boundary_refiner(final_out, x, features)
             
-            # 在解码路径添加扰动
-            if self.adv_mode and hasattr(self, 'feature_perturb'):
-                dec1 = self.feature_perturb(dec1)
-            
-            # 返回预测结果和不确定性
-            return enhanced_out, uncertainty
+            # 边界增强的最终输出
+            if hasattr(self, 'boundary_enhancer'):
+                refined_features = self.boundary_enhancer(dec1)
+                output = refined_out * 0.7 + enhanced_edge * 0.3
+            else:
+                output = refined_out * 0.7 + enhanced_edge * 0.3
         else:
-            # 标准模式 - 单次预测
-            final_out = self.final(dec1)
+            # 无内部优化时的输出
+            output = final_out * 0.7 + enhanced_edge * 0.3
+        
+        # 不确定性估计（仅在贝叶斯模式）
+        if hasattr(self, 'uncertainty_estimator') and self.training:
+            # 修复：确保使用.detach()隔离不需要传播梯度的路径
+            with torch.no_grad():
+                mean_pred, uncertainty = self.uncertainty_estimator(dec1.detach(), self.mc_samples)
             
-            # 增强边界的分割结果
-            enhanced_out = final_out * 0.7 + enhanced_edge * 0.3
-            enhanced_out = torch.clamp(enhanced_out, 0.0, 1.0)
+            # 不确定性引导的输出调整 - 保持计算图连接
+            # 高不确定性区域更依赖边缘特征
+            uncertainty_weight = torch.sigmoid(uncertainty * 5)
+            uncertainty_term = enhanced_edge * (uncertainty_weight * 0.3)
+            output = output * (1 - uncertainty_weight * 0.3) + uncertainty_term
             
-            # 确保输出类型与输入一致（支持混合精度训练）
-            if enhanced_out.dtype != x.dtype:
-                enhanced_out = enhanced_out.to(x.dtype)
-            
-            # 在解码路径添加扰动
-            if self.adv_mode and hasattr(self, 'feature_perturb'):
-                dec1 = self.feature_perturb(dec1)
-            
-            return enhanced_out
+            # 如果是对抗训练模式，返回不确定性
+            if self.adv_mode:
+                return output, uncertainty
+        
+        # 避免使用.to()操作，可能会破坏梯度流
+        # 如果必须转换类型，使用.type_as()
+        if output.dtype != x.dtype:
+            output = output.type_as(x)
+        
+        return output
     
     def get_kl_divergence(self):
         """获取网络中所有贝叶斯层的KL散度"""
