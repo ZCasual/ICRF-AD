@@ -68,13 +68,27 @@ class TADBaseConfig:
 
 class AdversarialTAD(nn.Module):
     """对抗学习框架（完整实现）"""
-    def __init__(self, embed_dim=64, freeze_ratio=0.75, use_bayesian=True):
+    def __init__(self, input_channels=1, output_channels=1, embed_dim=64, freeze_ratio=0.5, adv_weight=0.1, use_bayesian=False, internal_optimization=True):
         super().__init__()
-        # 生成器 (分割网络) - 支持贝叶斯U-Net
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.adv_weight = adv_weight
+        
+        # 生成器网络 (U-Net变体)
         if use_bayesian:
-            self.generator = BayesianUNet(1, 1, adv_mode=True)
+            self.generator = BayesianUNet(
+                input_channels=input_channels,
+                output_channels=output_channels,
+                adv_mode=True,
+                mc_samples=5,
+                use_internal_optimization=internal_optimization,
+                optimization_iterations=2  # 设置内部优化迭代次数
+            )
         else:
-            self.generator = SimplifiedUNet(1, 1, adv_mode=True)
+            self.generator = SimplifiedUNet(
+                input_channels=input_channels,
+                output_channels=output_channels
+            )
         
         # 判别器 (边界检测+真实性判断)
         self.discriminator = EdgeAwareBiLSTM(
@@ -86,9 +100,6 @@ class AdversarialTAD(nn.Module):
         # 冻结参数机制
         self._frozen_params = set()
         self._freeze_parameters(freeze_ratio)
-        
-        # 对抗训练参数
-        self.adv_weight = 0.1
         
         # 是否为贝叶斯模式
         self.is_bayesian = use_bayesian

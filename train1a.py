@@ -211,6 +211,15 @@ class TADPipelineAdversarial(TADBaseConfig):
         # 最终平均
         gen_loss = gen_loss.mean()
         
+        # 如果使用了内部优化，我们可以添加内部激励历史记录到输出中
+        if 'reward_history' in outputs and outputs['reward_history'] is not None:
+            last_reward = outputs['reward_history'][-1]
+            # 可以将激励历史记录到日志或TensorBoard
+            if self.global_step % 10 == 0:  # 每10步记录一次
+                print(f"内部优化指标: IC={last_reward['internal_consistency']:.4f}, "
+                      f"ES={last_reward['edge_significance']:.4f}, "
+                      f"CP={last_reward['change_point']:.4f}")
+        
         # 不确定性引导损失（如果可用）
         if 'uncertainty' in outputs:
             # 检查不确定性值是否正常

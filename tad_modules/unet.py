@@ -5,14 +5,18 @@ import math
 import numpy as np
 from .bayesian_layers import BayesianConvBlock
 from .self_reflection import SelfReflectionModule, UncertaintyEstimator
+from .internal_reward import TADBoundaryReward, BoundaryRefiner
 
 class BayesianUNet(nn.Module):
-    """结合贝叶斯层和自我反思机制的U-Net"""
-    def __init__(self, input_channels=1, output_channels=1, adv_mode=False, mc_samples=5):
+    """结合贝叶斯层和自我反思机制的U-Net，增加了内部边界优化"""
+    def __init__(self, input_channels=1, output_channels=1, adv_mode=False, mc_samples=5,
+                 use_internal_optimization=True, optimization_iterations=2):
         super().__init__()
         self.input_channels = input_channels
         self.output_channels = output_channels
         self.mc_samples = mc_samples
+        self.adv_mode = adv_mode
+        self.use_internal_optimization = use_internal_optimization
         
         # 编码器 (下采样路径)
         self.enc1 = nn.Sequential(
@@ -32,19 +36,36 @@ class BayesianUNet(nn.Module):
             BayesianConvBlock(64, 64)
         )
         
+        self.enc4 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            BayesianConvBlock(64, 128),
+            BayesianConvBlock(128, 128)
+        )
+        
         # 自我反思模块 - 在各跳跃连接处添加
         self.reflect1 = SelfReflectionModule(16)
         self.reflect2 = SelfReflectionModule(32)
         self.reflect3 = SelfReflectionModule(64)
         
-        # 解码器 (上采样路径)
-        self.dec2 = nn.Sequential(
-            BayesianConvBlock(96, 32),
+        # 解码器 (上采样路径) - 修复通道数匹配问题
+        self.dec4 = nn.Sequential(
+            BayesianConvBlock(128 + 64, 64),  # 128(enc4) + 64(enc3)
+            BayesianConvBlock(64, 64)
+        )
+        
+        self.dec3 = nn.Sequential(
+            BayesianConvBlock(64 + 32, 32),  # 64(dec4) + 32(enc2)
             BayesianConvBlock(32, 32)
         )
         
+        self.dec2 = nn.Sequential(
+            BayesianConvBlock(32 + 16, 16),  # 32(dec3) + 16(enc1)
+            BayesianConvBlock(16, 16)
+        )
+        
+        # 这里是问题所在，应该只接收16通道输入，而不是32
         self.dec1 = nn.Sequential(
-            BayesianConvBlock(48, 16),
+            BayesianConvBlock(16, 16),  # 修正：不再连接enc1，只使用dec2上采样结果
             BayesianConvBlock(16, 16)
         )
         
@@ -65,8 +86,29 @@ class BayesianUNet(nn.Module):
             nn.Sigmoid()
         )
         
+        # 新增：TAD边界优化模块
+        if use_internal_optimization:
+            # 创建激励函数模块
+            self.boundary_reward = TADBoundaryReward(
+                alpha=1.0, beta=2.0, gamma=1.5, window_size=5
+            )
+            
+            # 创建边界精化模块
+            self.boundary_refiner = BoundaryRefiner(
+                reward_module=self.boundary_reward,
+                iterations=optimization_iterations,
+                learning_rate=0.01
+            )
+            
+            # 边界增强模块
+            self.boundary_enhancer = nn.Sequential(
+                nn.Conv2d(16, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True)
+            )
+        
         # 对抗训练专用层
-        self.adv_mode = adv_mode
         if adv_mode:
             self.feature_perturb = nn.Sequential(
                 nn.Conv2d(16, 16, 3, padding=1),
@@ -84,24 +126,28 @@ class BayesianUNet(nn.Module):
         enc1 = self.enc1(x)
         enc2 = self.enc2(enc1)
         enc3 = self.enc3(enc2)
+        enc4 = self.enc4(enc3)
         
         # 自我反思 - 编码器特征
         enc3_refined, unc3 = self.reflect3(enc3)
         
         # 解码器路径与跳跃连接
-        dec2_up = F.interpolate(enc3_refined, size=enc2.shape[2:], mode='bilinear', align_corners=False)
+        dec4_up = F.interpolate(enc4, size=enc3.shape[2:], mode='bilinear', align_corners=False)
+        dec4_cat = torch.cat([dec4_up, enc3], dim=1)
+        dec4 = self.dec4(dec4_cat)
         
-        # 自我反思 - 第二层跳跃连接
-        enc2_refined, unc2 = self.reflect2(enc2, prev_prediction=unc3)
-        dec2_cat = torch.cat([dec2_up, enc2_refined], dim=1)
+        dec3_up = F.interpolate(dec4, size=enc2.shape[2:], mode='bilinear', align_corners=False)
+        dec3_cat = torch.cat([dec3_up, enc2], dim=1)
+        dec3 = self.dec3(dec3_cat)
+        
+        dec2_up = F.interpolate(dec3, size=enc1.shape[2:], mode='bilinear', align_corners=False)
+        dec2_cat = torch.cat([dec2_up, enc1], dim=1)
         dec2 = self.dec2(dec2_cat)
         
-        dec1_up = F.interpolate(dec2, size=enc1.shape[2:], mode='bilinear', align_corners=False)
-        
-        # 自我反思 - 第一层跳跃连接
-        enc1_refined, unc1 = self.reflect1(enc1, prev_prediction=unc2)
-        dec1_cat = torch.cat([dec1_up, enc1_refined], dim=1)
-        dec1 = self.dec1(dec1_cat)
+        # 修复：不再连接enc1，只使用dec2上采样结果
+        dec1_up = F.interpolate(dec2, size=x.shape[2:], mode='bilinear', align_corners=False)
+        # 不再进行连接，直接传入dec1
+        dec1 = self.dec1(dec1_up)
         
         # TAD边界增强
         edge_map = self.edge_enhancement(dec1)
@@ -156,11 +202,23 @@ class BayesianUNet(nn.Module):
             if hasattr(layer, 'kl_divergence'):
                 kl_div += layer.kl_divergence
         
+        for layer in self.enc4:
+            if hasattr(layer, 'kl_divergence'):
+                kl_div += layer.kl_divergence
+        
         # 收集解码器的KL散度
+        for layer in self.dec4:
+            if hasattr(layer, 'kl_divergence'):
+                kl_div += layer.kl_divergence
+        
+        for layer in self.dec3:
+            if hasattr(layer, 'kl_divergence'):
+                kl_div += layer.kl_divergence
+        
         for layer in self.dec2:
             if hasattr(layer, 'kl_divergence'):
                 kl_div += layer.kl_divergence
-                
+        
         for layer in self.dec1:
             if hasattr(layer, 'kl_divergence'):
                 kl_div += layer.kl_divergence
