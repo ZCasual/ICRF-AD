@@ -131,10 +131,16 @@ class BayesianUNet(nn.Module):
         """前向传播，支持不确定性估计"""
         # 如果没有指定采样数量，使用默认值
         if n_samples <= 0:
-            n_samples = 1 if not return_uncertainty else self.mc_samples
+            n_samples = self.mc_samples if return_uncertainty else 1
         
-        # 首先进行Canny边缘检测 - 在torch.no_grad()外部执行以保留梯度流
-        canny_edges, _ = self.canny_detector(x)
+        # 首先进行Canny边缘检测
+        with torch.set_grad_enabled(True):  # 确保梯度计算启用
+            # 确保输入需要梯度
+            if not x.requires_grad:
+                x.requires_grad_(True)
+            
+            # 调用Canny检测器
+            canny_edges, _ = self.canny_detector(x)
         
         # 编码器路径
         enc1 = self.enc1(x)
@@ -187,33 +193,38 @@ class BayesianUNet(nn.Module):
             # 提取特征用于边界精化
             features = dec1  # 使用解码器最后层特征
             
-            # 修复：确保精化过程不会切断梯度流
-            with torch.enable_grad():  # 确保梯度计算
+            # 确保输入需要梯度
+            final_out.requires_grad_(True)
+            
+            # 明确使用需要梯度的上下文
+            with torch.set_grad_enabled(True):
                 # 精化边界
                 refined_out, reward_history = self.boundary_refiner(final_out, x, features)
             
-            # 边界增强的最终输出
+            # 边界增强的最终输出 - 修改权重比例
             if hasattr(self, 'boundary_enhancer'):
                 refined_features = self.boundary_enhancer(dec1)
-                output = refined_out * 0.7 + enhanced_edge * 0.3
+                output = refined_out * 0.6 + enhanced_edge * 0.4  # 增加边缘权重
             else:
-                output = refined_out * 0.7 + enhanced_edge * 0.3
+                output = refined_out * 0.6 + enhanced_edge * 0.4  # 增加边缘权重
         else:
-            # 无内部优化时的输出
-            output = final_out * 0.7 + enhanced_edge * 0.3
+            # 无内部优化时的输出 - 同样增加边缘权重
+            output = final_out * 0.6 + enhanced_edge * 0.4
         
         # 不确定性估计（不论训练模式）
         uncertainty = None
         if return_uncertainty or (hasattr(self, 'uncertainty_estimator') and self.training and self.adv_mode):
-            # 使用no_grad()执行蒙特卡洛采样，避免额外的内存消耗
+            # 对于不确定性估计，我们可以使用no_grad，因为它不需要影响主网络的梯度流
             with torch.no_grad():
                 mean_pred, uncertainty = self.uncertainty_estimator(dec1.detach(), n_samples)
             
-            # 仅在训练时使用不确定性调整输出
+            # 仅在训练时使用不确定性调整输出，并确保梯度流
             if self.training:
                 # 不确定性引导的输出调整 - 保持计算图连接
                 uncertainty_weight = torch.sigmoid(uncertainty * 5)
+                # 创建新张量以保持梯度流
                 uncertainty_term = enhanced_edge * (uncertainty_weight * 0.3)
+                # 使用操作组合确保梯度正确传播
                 output = output * (1 - uncertainty_weight * 0.3) + uncertainty_term
         
         # 确保输出类型一致

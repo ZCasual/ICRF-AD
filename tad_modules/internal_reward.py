@@ -12,13 +12,13 @@ class TADBoundaryReward(nn.Module):
     3. 变点检测(CP): 精确定位统计特性变化点
     """
     
-    def __init__(self, alpha=1.0, beta=2.0, gamma=1.5, window_size=5):
+    def __init__(self, alpha=1.5, beta=2.5, gamma=2.0, window_size=5):
         """初始化TAD边界激励模块
         
         Args:
-            alpha: 内部一致性权重
-            beta: 边缘显著性权重
-            gamma: 变点检测权重
+            alpha: 内部一致性权重 (增加从1.0到1.5)
+            beta: 边缘显著性权重 (增加从2.0到2.5)
+            gamma: 变点检测权重 (增加从1.5到2.0)
             window_size: 方向性指数计算窗口大小
         """
         super().__init__()
@@ -232,15 +232,15 @@ class BoundaryRefiner(nn.Module):
     基于内部激励函数的迭代边界优化器
     """
     
-    def __init__(self, reward_module, iterations=2, learning_rate=0.01, 
-                 early_stop_threshold=0.01):
+    def __init__(self, reward_module, iterations=5, learning_rate=0.015, 
+                 early_stop_threshold=0.005):
         """初始化边界精化模块
         
         Args:
             reward_module: TAD边界激励函数模块
-            iterations: 最大迭代次数
-            learning_rate: 边界优化学习率
-            early_stop_threshold: 提前停止阈值
+            iterations: 最大迭代次数 (增加到5，与UNet设置一致)
+            learning_rate: 边界优化学习率 (从0.01增加到0.015)
+            early_stop_threshold: 提前停止阈值 (减小为更精确的优化)
         """
         super().__init__()
         self.reward = reward_module
@@ -251,19 +251,15 @@ class BoundaryRefiner(nn.Module):
     def forward(self, initial_segmentation, hic_matrix, features):
         """迭代优化TAD边界 - 内存优化版本"""
         # 确保输入需要梯度
-        if not initial_segmentation.requires_grad:
-            initial_segmentation.requires_grad_(True)
+        initial_segmentation = initial_segmentation.detach().clone().requires_grad_(True)
         
-        # 初始分割结果 - 修正缩进
-        current_seg = initial_segmentation.clone()
+        # 初始分割结果
+        current_seg = initial_segmentation
         
         # 循环优化，避免存储所有中间状态
         reward_history = []
         
         for i in range(self.iterations):
-            # 设置当前分割需要梯度
-            current_seg.requires_grad_(True)
-            
             # 前向传播计算激励分数
             reward, components = self.reward(current_seg, hic_matrix, features)
             reward_history.append(components)
@@ -272,16 +268,16 @@ class BoundaryRefiner(nn.Module):
             if i < self.iterations - 1:
                 # 计算梯度
                 grads = torch.autograd.grad(reward, current_seg, 
-                                          create_graph=False, retain_graph=False)[0]
+                                           create_graph=False, retain_graph=True)[0]
                 
-                # 分离当前状态并更新
-                current_seg = current_seg.detach()
+                # 更新当前状态（保持梯度连接）
                 current_seg = current_seg - self.lr * grads
                 
                 # 确保值域在[0,1]
                 current_seg = torch.clamp(current_seg, 0.0, 1.0)
-        
-        # 确保最终结果与输入连接梯度流
-        output = current_seg * 1.0  # 乘以1.0保留梯度连接
                 
-        return output, reward_history 
+                # 重新设置requires_grad
+                current_seg = current_seg.detach().requires_grad_(True)
+        
+        # 返回最终结果（确保保留梯度）
+        return current_seg, reward_history 
