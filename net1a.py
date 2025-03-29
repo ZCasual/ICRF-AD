@@ -35,7 +35,7 @@ class TADBaseConfig:
         self.epsilon_base = 0.05
         self.use_theory_gamma = True
         self.boundary_weight = 0.3
-        self.num_epochs = 40
+        self.num_epochs = 500
 
     def get_model_params(self):
         """获取模型相关参数字典"""

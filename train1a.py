@@ -28,7 +28,7 @@ class TADPipelineAdversarial(TADBaseConfig):
         self.adj_graph = None
         self.normalized_matrix = None
         torch.backends.cuda.checkpoint_activations = False
-        torch.backends.cuda.checkpoint_layers_n = 10
+        torch.backends.cuda.checkpoint_layers_n = 50
 
     def load_data(self):
         """数据加载过程：加载Hi-C数据并返回接触矩阵"""
@@ -457,19 +457,36 @@ class TADPipelineAdversarial(TADBaseConfig):
                 
                 plt.figure(figsize=(14, 6))
                 
+                # 添加数据范围检查，动态调整bin数量
                 # μ分布
                 plt.subplot(1, 2, 1)
-                plt.hist(mu.flatten(), bins=50, alpha=0.7, color='blue')
-                plt.title(f"Weight Mean (μ) Distribution", fontsize=14)
-                plt.xlabel("Value", fontsize=12)
-                plt.ylabel("Frequency", fontsize=12)
+                mu_range = np.max(mu) - np.min(mu)
+                mu_bins = min(50, max(5, int(mu_range * 100)))  # 动态设置bin数量
+                try:
+                    plt.hist(mu.flatten(), bins=mu_bins, alpha=0.7, color='blue')
+                    plt.title(f"Weight Mean (μ) Distribution", fontsize=14)
+                    plt.xlabel("Value", fontsize=12)
+                    plt.ylabel("Frequency", fontsize=12)
+                except ValueError as e:
+                    # 如果出错，用更简单的方式显示
+                    plt.text(0.5, 0.5, f"μ值范围太小: {mu_range:.6f}\n平均值: {np.mean(mu):.6f}", 
+                            ha='center', fontsize=12)
+                    plt.axis('on')
                 
                 # σ分布
                 plt.subplot(1, 2, 2)
-                plt.hist(sigma.flatten(), bins=50, alpha=0.7, color='red')
-                plt.title(f"Weight Std Dev (σ) Distribution", fontsize=14)
-                plt.xlabel("Value", fontsize=12)
-                plt.ylabel("Frequency", fontsize=12)
+                sigma_range = np.max(sigma) - np.min(sigma)
+                sigma_bins = min(50, max(5, int(sigma_range * 100)))  # 动态设置bin数量
+                try:
+                    plt.hist(sigma.flatten(), bins=sigma_bins, alpha=0.7, color='red')
+                    plt.title(f"Weight Std Dev (σ) Distribution", fontsize=14)
+                    plt.xlabel("Value", fontsize=12)
+                    plt.ylabel("Frequency", fontsize=12)
+                except ValueError as e:
+                    # 如果出错，用更简单的方式显示
+                    plt.text(0.5, 0.5, f"σ值范围太小: {sigma_range:.6f}\n平均值: {np.mean(sigma):.6f}", 
+                            ha='center', fontsize=12)
+                    plt.axis('on')
                 
                 plt.tight_layout()
                 plt.savefig(os.path.join(epoch_dir, "bayesian_weight_distribution.png"), dpi=300)
