@@ -82,7 +82,7 @@ class AdversarialTAD(nn.Module):
                 adv_mode=True,
                 mc_samples=5,
                 use_internal_optimization=internal_optimization,
-                optimization_iterations=2  # 设置内部优化迭代次数
+                optimization_iterations=5  # 增加内部优化迭代次数
             )
         else:
             self.generator = SimplifiedUNet(
@@ -189,14 +189,14 @@ class AdversarialTAD(nn.Module):
             # 如果是贝叶斯模型，加入KL散度正则化
             if hasattr(self.generator, 'get_kl_divergence'):
                 kl_div = self.generator.get_kl_divergence()
-                kl_weight = 1.0 / real_labels.shape[0]  # 按批次大小缩放
-                gen_loss = gen_loss + kl_weight * kl_div
+                kl_div_clamped = torch.clamp(kl_div, min=0, max=1000.0)
+                gen_loss = gen_loss + 0.1 * kl_div_clamped
         
         # 对抗损失（生成器欺骗判别器）
         adv_loss = F.binary_cross_entropy(
             outputs['fake_prob'], 
             torch.ones_like(outputs['fake_prob'])
-        )
+        ) * 0.5  # 降低对抗损失权重
         
         # 判别器损失
         real_loss = F.binary_cross_entropy(

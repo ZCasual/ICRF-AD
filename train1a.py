@@ -78,11 +78,10 @@ class TADPipelineAdversarial(TADBaseConfig):
             'total': AverageMeter('总损失')
         }
         
-        # 学习率调度参数
-        warmup_steps = 10  # 前10步保持初始学习率
-        
         # 计算总步数
         total_steps = self.num_epochs * len(tiles)
+        warmup_steps = int(0.1 * total_steps)  # 前10%的步骤保持初始学习率
+        print(f"总训练步数: {total_steps}, 预热步数: {warmup_steps}")
         # 计算余弦退火截止步数 (总进度的60%)
         cosine_end_step = int(0.6 * total_steps)
         
@@ -105,19 +104,21 @@ class TADPipelineAdversarial(TADBaseConfig):
                 if global_step < warmup_steps:
                     current_lr_gen = initial_lr_gen
                     current_lr_disc = initial_lr_disc
-                    lr_phase = "初始"
+                    lr_phase = "预热"
                 
-                # 2. 从第11步到总进度的60%使用余弦退火
+                # 2. 从第11步到总进度的60%使用余弦递增(而非退火)
                 elif global_step < cosine_end_step:
-                    # 计算余弦退火的当前进度 [0,1]
+                    # 计算余弦进度 [0,1]
                     progress = (global_step - warmup_steps) / (cosine_end_step - warmup_steps)
-                    # 余弦退火公式
-                    cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
                     
-                    # 计算当前学习率
-                    current_lr_gen = target_lr_gen + cosine_factor * (initial_lr_gen - target_lr_gen)
-                    current_lr_disc = target_lr_disc + cosine_factor * (initial_lr_disc - target_lr_disc)
-                    lr_phase = "余弦"
+                    # 余弦递增公式 - 从预热期结束值平滑增加到目标值
+                    # 注意：修改公式以适应从小到大的变化，使用(1-cos)替代(1+cos)
+                    cosine_factor = 0.5 * (1 - math.cos(math.pi * progress))
+                    
+                    # 计算当前学习率 - 注意参数顺序，确保是从小到大
+                    current_lr_gen = initial_lr_gen + cosine_factor * (target_lr_gen - initial_lr_gen)
+                    current_lr_disc = initial_lr_disc + cosine_factor * (target_lr_disc - initial_lr_disc)
+                    lr_phase = "余弦增长"
                 
                 # 3. 从总进度的60%到结束保持目标学习率
                 else:
